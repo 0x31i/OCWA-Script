@@ -15,7 +15,6 @@
 5. [Phase 4: Lateral Movement](#phase-4-lateral-movement)
 6. [Phase 5-7: Flag Hunting](#phase-5-7-flag-hunting)
 7. [Phase 8: Privilege Escalation](#phase-8-privilege-escalation)
-8. [Learning Resources and Best Practices](#learning-resources-and-best-practices)
 
 ---
 
@@ -89,7 +88,7 @@ sudo apt install -y \
 ```bash
 # Web application testing tools
 sudo apt install -y \
-    weevely laudanum webshells   # Pre-built shells
+    weevely laudanum webshells \   # Pre-built shells
 ```
 
 **Verification Screenshot:**
