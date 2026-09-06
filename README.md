@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/ocwa-setup-script-logo.jpg" alt="OCWA-Script" width="820">
+</p>
+
 # OCWA-Script: OVERCLOCK Lab (Debian web server)
 
 Automated setup for the **OCWA** web-application box, one target in the **OVERCLOCK**
