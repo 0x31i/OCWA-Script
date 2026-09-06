@@ -167,6 +167,10 @@ if [ -d "/var/www/html/OC" ]; then
 
     # Preguntar al usuario qué acción tomar / Ask the user what action to take
     read -p "$(get_language_message "\e[96mDo you want to delete the existing folder and download it again (y/n):\e[0m " "\e[96m¿Desea borrar la carpeta existente y descargarla de nuevo? (s/n):\e[0m ")" user_response
+    # Unattended / non-interactive default: an empty answer (e.g. stdin from
+    # /dev/null during a scripted deploy) re-downloads fresh instead of aborting
+    # the whole install before the internal.secrets DB seeding runs below.
+    user_response=${user_response:-y}
 
     if [[ "$user_response" == "s" || "$user_response" == "y" ]]; then
         # Borrar la carpeta existente / Delete existing folder
@@ -226,6 +230,20 @@ sleep 2
 dvwa_config_message=$(get_language_message "\e[96mConfiguring OCWA...\e[0m" "\e[96mConfigurando OCWA...\e[0m")
 echo -e "$dvwa_config_message"
 cp /var/www/html/OC/config/config.inc.php.dist /var/www/html/OC/config/config.inc.php
+
+# Set the default security level to 'medium' so the web-exploitation phase works
+# as the walkthrough teaches it. The upstream .dist defaults to 'impossible' (the
+# SECURE build): the upload module re-encodes images and randomises filenames, so
+# every bypass is rejected. 'medium' is the level the walkthrough targets — the
+# upload check is a forgeable Content-Type (Burp: name it shell.php, keep
+# Content-Type: image/jpeg), which is the intended lesson. (Only touches the
+# default_security_level line; the getenv() override still wins if set.)
+sed -i "/default_security_level/s/'impossible'/'medium'/" /var/www/html/OC/config/config.inc.php
+
+# Dedup the DOBBY flag: keep the one on homepage.php (the walkthrough's H2 target);
+# strip the duplicate the page header showed on EVERY page. Turnkey even if the
+# github app repo hasn't been re-pushed yet.
+sed -i 's/FLAG{DOBBY[0-9]*}//' /var/www/html/OC/dvwa/includes/ocPage.inc.php 2>/dev/null || true
 sleep 2
 
 # Asignar los permisos adecuados a DVWA / Assign the appropriate permissions to DVWA
@@ -276,6 +294,11 @@ else
     sleep 2
 fi
 
+# Serve the app at the web ROOT so the walkthrough's paths (/login.php,
+# /vulnerabilities/..., /hackable/uploads/) work as written. The OCWA app has no
+# hardcoded /OC/ absolute paths, so pointing DocumentRoot at it is safe.
+sed -i 's#DocumentRoot /var/www/html$#DocumentRoot /var/www/html/OC#' /etc/apache2/sites-available/000-default.conf
+
 # Reinicia el Apache / Apache restart
 apache_restart_message=$(get_language_message "\e[96mRestarting Apache...\e[0m" "\e[96mReiniciando Apache...\e[0m")
 echo -e "$apache_restart_message"
@@ -283,7 +306,36 @@ systemctl enable apache2 &>/dev/null
 systemctl restart apache2 &>/dev/null
 sleep 2
 
-success_message=$(get_language_message "\e[92mOCWA has been installed successfully. Access \e[93mhttp://localhost/OC\e[0m \e[92mto get started." "\e[92mOCWA se ha instalado correctamente. Accede a \e[93mhttp://localhost/OC\e[0m \e[92mpara comenzar.")
+# Seed the DVWA database (schema + custom users incl. brandon) so the app is
+# usable immediately. A fresh DVWA otherwise needs a manual setup.php
+# "Create / Reset Database" click before ANY login works, which blocks every
+# web/upload flag on a turnkey student build.
+seed_jar=$(mktemp)
+seed_token=$(curl -s -c "$seed_jar" http://localhost/setup.php | grep -oP "user_token'\s+value='\K[^']+")
+curl -s -b "$seed_jar" --data-urlencode "create_db=Create / Reset Database" --data-urlencode "user_token=$seed_token" http://localhost/setup.php >/dev/null 2>&1
+rm -f "$seed_jar"
+
+# --- internal.secrets: FUNCTIONAL MySQL loot for M2 + G1. A world-readable
+# my.cnf (auto-loaded by the mysql client) leaks a WORKING read-only cred; the
+# flags are ROWS here, not in any text file a student can grep. Weakness:
+# exposed DB credential. Consequence: SELECT the internal data.
+if [ -f /root/.oc_flags.env ]; then
+    . /root/.oc_flags.env
+    # --no-defaults so THIS admin setup bypasses the world-readable oc.cnf
+    # [client] creds (which every plain `mysql` inherits -- that's the student's
+    # path). Without it, root's own mysql would try to auth as the not-yet-created
+    # oc_user and fail.
+    mysql --no-defaults <<SQL 2>/dev/null || true
+CREATE DATABASE IF NOT EXISTS internal;
+CREATE TABLE IF NOT EXISTS internal.secrets (name VARCHAR(64) PRIMARY KEY, value TEXT);
+REPLACE INTO internal.secrets VALUES ('monitoring_key','${M2}'),('rails_secret_key_base','${G1}');
+CREATE USER IF NOT EXISTS 'oc_user'@'localhost' IDENTIFIED BY 'weakpass123';
+GRANT SELECT ON internal.* TO 'oc_user'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+fi
+
+success_message=$(get_language_message "\e[92mOCWA has been installed successfully. Access \e[93mhttp://localhost/\e[0m \e[92mto get started." "\e[92mOCWA se ha instalado correctamente. Accede a \e[93mhttp://localhost/\e[0m \e[92mpara comenzar.")
 echo -e "$success_message"
 
 #Mostrar al usuario las credenciales después de la configuración / Show user credentials after configuration
@@ -294,5 +346,5 @@ echo -e "Password: \033[93mpassword\033[0m"
 
 # Fin del instalador / End of installer
 echo
-final_message=$(get_language_message "\033[95mWith ♡ by 0x31i" "\033[95mCon ♡ by 0x31i")
+final_message=$(get_language_message "\033[95mWith by 0x31i" "\033[95mCon by 0x31i")
 echo -e "$final_message"

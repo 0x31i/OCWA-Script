@@ -7,7 +7,10 @@
 # Version: 2.0 - Modified
 # ===============================================
 
-set -e
+# NOTE: `set -e` intentionally NOT enabled. This installer is best-effort: each
+# package/flag step guards its own failures, and one non-critical non-zero must
+# never abort the provision before the flags env (/root/.oc_flags.env) and the
+# database seeding run near the end of the script.
 
 # Color codes for output
 RED='\033[0;31m'
@@ -27,6 +30,39 @@ echo -e "${BLUE}    Vulnerable Debian OC Setup Script${NC}"
 echo -e "${BLUE}    Educational Purpose Only - v2.0${NC}"
 echo -e "${BLUE}===============================================${NC}"
 
+# ===============================================
+# Build dependencies (required for several flags)
+#   - gcc/build-essential : compile Flag 'N2' vulnerable_binary
+#   - binutils            : provides `strings` used to solve it
+#   - docker.io           : Flag 'G3' docker daemon.json + docker-group privesc
+# These are best-effort: on an air-gapped build host apt will fail; we warn
+# loudly rather than abort so the rest of the lab still builds.
+# ===============================================
+echo -e "${GREEN}[+] Installing build dependencies (gcc / binutils / docker)...${NC}"
+export DEBIAN_FRONTEND=noninteractive
+
+# On a freshly-booted cloud image, cloud-init / unattended-upgrades hold the
+# dpkg lock for the first minute or two. Wait for it to clear so these installs
+# do not fail and get mis-reported as "offline" (which then silently skips the
+# postgresql/docker/gcc flag packages).
+echo -e "${GREEN}[+] Waiting for boot-time apt/dpkg activity to finish...${NC}"
+_aptwait=0
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    [ "$_aptwait" -ge 300 ] && { echo -e "${YELLOW}[!] apt still locked after 300s - continuing anyway${NC}"; break; }
+    sleep 3; _aptwait=$((_aptwait + 3))
+done
+
+# DPkg::Lock::Timeout makes apt itself wait for the lock instead of failing.
+APT_OPTS="-o DPkg::Lock::Timeout=300"
+apt-get $APT_OPTS update -y 2>/dev/null || echo -e "${YELLOW}[!] apt-get update failed (offline?) - continuing${NC}"
+for pkg in build-essential binutils docker.io postgresql; do
+    if apt-get $APT_OPTS install -y "$pkg" 2>/dev/null; then
+        echo -e "${GREEN}  [+] $pkg installed${NC}"
+    else
+        echo -e "${RED}  [!] Could not install $pkg (offline?) - dependent flag may be skipped${NC}"
+    fi
+done
+
 # Create directory structure
 echo -e "${GREEN}[+] Creating OC directory structure...${NC}"
 mkdir -p /opt/oc/{flags,scripts,exploits,configs}
@@ -41,14 +77,32 @@ mkdir -p /var/log/webapp
 mkdir -p /var/spool/cron/atjobs
 mkdir -p /tmp/.hidden
 
-# Generate deterministic "random" numbers for flags
+# ---------------------------------------------------------------------------
+# FLAG SEED — the single source of truth for every flag on this box.
+#   * Change this ONE value to ROTATE all flags (they regenerate deterministically).
+#   * Keep it IDENTICAL across the three lab build scripts (win10 / server / OCWA).
+#   * This build script NEVER emits the plaintext answers. Generate the instructor
+#     answer key OFF-box with Generate-AnswerKey.py (admin-only, NOT distributed).
+# ---------------------------------------------------------------------------
+OC_FLAG_SEED="${OC_FLAG_SEED:-}"
+if [ -z "$OC_FLAG_SEED" ]; then
+    # No seed supplied: generate a random one so a home lab "just works".
+    # The OFFICIAL graded box is built by exporting the secret course seed first.
+    OC_FLAG_SEED="$(openssl rand -hex 16)"
+    echo "[i] No OC_FLAG_SEED set -- generated a random lab seed: $OC_FLAG_SEED"
+    echo "    Save it if you want to regenerate your own answer key later."
+fi
+
 echo -e "${GREEN}[+] Generating OC flags...${NC}"
 
-# Function to generate consistent 8-digit numbers
+# Consistent 8-digit id, KEYED and SEED-derived: HMAC-SHA256(OC_FLAG_SEED, key) ->
+# 8 digits. Same math as the Windows scripts + Generate-AnswerKey.py, so one seed
+# governs all boxes and one off-box generator reproduces every value.
 gen_flag_id() {
-    local seed="$1"
-    local salt="OC2024LabV2"
-    echo -n "${seed}${salt}" | md5sum | cut -c1-8 | tr 'a-f' '0-5'
+    local key="$1"
+    local h
+    h=$(printf '%s' "$key" | openssl dgst -sha256 -hmac "$OC_FLAG_SEED" -r | cut -d' ' -f1)
+    printf '%08d' "$(( 16#${h:8:8} % 100000000 ))"
 }
 
 # Generate flag IDs (obfuscated)
@@ -75,6 +129,7 @@ FLAG_IDS["B1"]=$(gen_flag_id "curse19")
 FLAG_IDS["G3"]=$(gen_flag_id "elder20")
 FLAG_IDS["N2"]=$(gen_flag_id "snake21")
 FLAG_IDS["H4"]=$(gen_flag_id "soul22")
+FLAG_IDS["R2"]=$(gen_flag_id "riddle23")
 
 # Map to actual names (obfuscated storage)
 declare -A FLAG_NAMES
@@ -100,11 +155,35 @@ FLAG_NAMES["B1"]="BELLATRIX"
 FLAG_NAMES["G3"]="GRINDELWALD"
 FLAG_NAMES["N2"]="NAGINI"
 FLAG_NAMES["H4"]="HORCRUX"
+FLAG_NAMES["R2"]="RIDDLE"
 
 # Build flags dynamically
 build_flag() {
     local key="$1"
     echo "FLAG{${FLAG_NAMES[$key]}${FLAG_IDS[$key]}}"
+}
+
+# --- flag-hardening helpers (grep-proofing) ----------------------------------
+# GOAL: a naive `grep -rIa 'FLAG{' /` must find NOTHING at a student's current
+# privilege level. build_flag still returns the PLAINTEXT value (used only by
+# the root-only answer-key report). At rest, encode/gate every flag except the
+# warm-up. base64 = easy tier (recognize + decode); hex = one step up. GATE and
+# DERIVE flags change perms/logic at their own site, not here.
+enc_b64() { printf '%s' "$(build_flag "$1")" | base64; }
+enc_hex() { printf '%s' "$(build_flag "$1")" | od -An -v -tx1 | tr -d ' \n'; }
+# base64url (JWT-style: +/ -> -_ , strip padding)
+b64url() { base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '='; }
+# jwt_flag KEY [sub]: emit a realistic HS256 JWT whose payload carries the flag.
+# A grep for FLAG{ misses it (base64url); the student decodes the middle segment
+# (real skill). Tokens leaking in logs/history/git is a top real-world finding.
+jwt_flag() {
+    local key="$1" sub="${2:-oc-service}" flag h p hb pb sig
+    flag="$(build_flag "$key")"
+    h='{"alg":"HS256","typ":"JWT"}'
+    p="{\"sub\":\"${sub}\",\"iat\":1710000000,\"scope\":\"internal\",\"flag\":\"${flag}\"}"
+    hb=$(printf '%s' "$h" | b64url); pb=$(printf '%s' "$p" | b64url)
+    sig=$(printf '%s' "${hb}.${pb}" | openssl dgst -sha256 -hmac 'oc-signing-key' -binary | b64url)
+    printf '%s.%s.%s' "$hb" "$pb" "$sig"
 }
 
 # ===============================================
@@ -123,7 +202,18 @@ useradd -m -s /bin/bash admin_backup 2>/dev/null || true
 echo "admin_backup:admin" | chpasswd
 
 # Plant EASY flag in user description
-usermod -c "$(build_flag 'H1')" user1
+usermod -c "John Reyes,IT Support" user1
+# H1 (FUNCTIONAL): a JWT bearer token leaks in user1's shell history (a curl to
+# the internal API). grep(FLAG) misses it; decode the JWT payload to recover it.
+cat > /home/user1/.bash_history << HIST
+ls -la
+cat /etc/hostname
+curl -s -H "Authorization: Bearer $(jwt_flag 'H1' 'user1')" http://127.0.0.1:8899/whoami
+sudo -l
+exit
+HIST
+chown user1:user1 /home/user1/.bash_history
+chmod 600 /home/user1/.bash_history
 
 # ===============================================
 # VULNERABILITY 2: Credential Leakage (NEW)
@@ -157,7 +247,7 @@ Username: mjones
 Password: Password1
 Notes: HR department workstation
 
-$(build_flag 'H2')
+$(enc_b64 'H2')
 
 [WARNING: This file should be encrypted!]
 ========================================
@@ -174,7 +264,7 @@ Redis: nopassword
 MongoDB: admin/admin
 FTP: ftpuser/ftppass
 
-$(build_flag 'R1')
+# CI/CD API token (rotate after migration): $(jwt_flag 'R1' 'ci-legacy')
 EOF
 chmod 644 /var/backups/system/old_passwords.txt
 
@@ -183,17 +273,43 @@ chmod 644 /var/backups/system/old_passwords.txt
 # ===============================================
 echo -e "${YELLOW}[*] Setting up vulnerable SUID binaries...${NC}"
 
-# Create vulnerable SUID script with MEDIUM flag
-cat > /usr/local/bin/backup_tool << EOF
-#!/bin/bash
-echo "Backup Tool v1.0"
-echo "$(build_flag 'S1')"
-echo "Enter file to backup:"
-read file
-cat "\$file" 2>/dev/null || echo "File not found"
-EOF
-chmod +s /usr/local/bin/backup_tool
-chmod 755 /usr/local/bin/backup_tool
+# Vulnerable SUID-root binary (MEDIUM flag). NOTE: a SUID *bash script* does NOT
+# work -- the Linux kernel ignores the setuid bit on interpreted scripts -- so this
+# must be a compiled binary. The SNAPE flag is stored in a root-only (0600) file;
+# the SUID binary reads it as root, and also backs up any file the caller names
+# (classic SUID arbitrary-read privesc). This makes the writeup's "SUID -> root" real.
+mkdir -p /root/.oc_backup
+build_flag 'S1' > /root/.oc_backup/system.flag
+chown root:root /root/.oc_backup/system.flag
+chmod 600 /root/.oc_backup/system.flag        # only root (or the SUID tool) can read it
+command -v gcc >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y gcc >/dev/null 2>&1
+cat > /tmp/backup_tool.c << 'CEOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+static void dump(const char *p){
+    FILE *f = fopen(p, "r");
+    if (!f) { puts("File not found"); return; }
+    char b[4096]; size_t n;
+    while ((n = fread(b, 1, sizeof b, f)) > 0) fwrite(b, 1, n, stdout);
+    fclose(f);
+}
+int main(void){
+    setgid(0); setuid(0);                 /* run as root (SUID) */
+    puts("Backup Tool v1.0");
+    dump("/root/.oc_backup/system.flag"); putchar('\n');   /* the protected flag */
+    printf("Enter file to backup: "); fflush(stdout);
+    char path[512];
+    if (fgets(path, sizeof path, stdin)) {
+        path[strcspn(path, "\n")] = 0;
+        if (path[0]) dump(path);          /* back up any file, as root */
+    }
+    return 0;
+}
+CEOF
+gcc -O2 -o /usr/local/bin/backup_tool /tmp/backup_tool.c 2>/dev/null && rm -f /tmp/backup_tool.c
+chown root:root /usr/local/bin/backup_tool
+chmod 4755 /usr/local/bin/backup_tool        # genuine SUID-root (rwsr-xr-x)
 
 # Make find SUID (classic privesc)
 chmod u+s /usr/bin/find 2>/dev/null || true
@@ -209,7 +325,7 @@ echo "developer ALL=(ALL) NOPASSWD: /usr/bin/python3" >> /etc/sudoers
 echo "admin_backup ALL=(ALL) NOPASSWD: /bin/less" >> /etc/sudoers
 
 # Create sudoers.d file with MEDIUM flag
-echo "# $(build_flag 'S2')" > /etc/sudoers.d/oc_flag
+echo "# $(enc_b64 'S2')" > /etc/sudoers.d/oc_flag
 chmod 440 /etc/sudoers.d/oc_flag
 
 # ===============================================
@@ -223,12 +339,18 @@ cat > /opt/scripts/cleanup.sh << EOF
 # System cleanup script
 echo "Cleaning temporary files..."
 rm -rf /tmp/*.tmp 2>/dev/null
-echo "$(build_flag 'L2')"
+echo "$(enc_b64 'L2')"
 EOF
 chmod 777 /opt/scripts/cleanup.sh
 
 # Add cron job
 echo "*/5 * * * * root /opt/scripts/cleanup.sh > /var/log/cleanup.log 2>&1" >> /etc/crontab
+
+# The crontab entry above is INERT unless the cron daemon is installed AND running.
+# Minimal Debian images ship without it, which silently kills the cleanup.sh -> root
+# privesc. Install cron and enable it so the world-writable script actually fires as root.
+command -v cron >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y cron >/dev/null 2>&1
+systemctl enable --now cron >/dev/null 2>&1 || service cron start >/dev/null 2>&1
 
 # ===============================================
 # VULNERABILITY 6: SSH Misconfigurations
@@ -240,14 +362,26 @@ sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_
 sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
+# Allow many concurrent pre-auth connections so the walkthrough's default
+# `hydra ... ssh://` brute force (which opens ~16 parallel sessions) is not
+# throttled/dropped by sshd. Without this, students must lower hydra to -t 2.
+sed -i 's/^#\?MaxStartups.*/MaxStartups 100:30:200/' /etc/ssh/sshd_config
+grep -q '^MaxStartups' /etc/ssh/sshd_config || echo 'MaxStartups 100:30:200' >> /etc/ssh/sshd_config
+sed -i 's/^#\?MaxSessions.*/MaxSessions 50/' /etc/ssh/sshd_config
+grep -q '^MaxSessions' /etc/ssh/sshd_config || echo 'MaxSessions 50' >> /etc/ssh/sshd_config
+
 # Add SSH banner with EASY flag
 echo "$(build_flag 'D1')" > /etc/ssh/banner
 echo "Welcome to OC Server" >> /etc/ssh/banner
+# root-only: the flag is delivered ONLY via the SSH pre-auth banner (ssh <host>),
+# not by `cat` — a low-priv shell can't read the source file.
+chmod 600 /etc/ssh/banner
 sed -i 's/^#Banner.*/Banner \/etc\/ssh\/banner/' /etc/ssh/sshd_config
 
 # Create SSH key with MEDIUM flag
 mkdir -p /home/developer/.ssh
-echo "$(build_flag 'T1')" > /home/developer/.ssh/authorized_keys.backup
+# (T1 is now a FUNCTIONAL leaked SSH key in the backup archive -- see below.)
+echo "# authorized_keys backup (empty)" > /home/developer/.ssh/authorized_keys.backup
 chmod 644 /home/developer/.ssh/authorized_keys.backup
 chown -R developer:developer /home/developer/.ssh
 
@@ -257,19 +391,48 @@ chown -R developer:developer /home/developer/.ssh
 echo -e "${YELLOW}[*] Creating hidden files with flags...${NC}"
 
 # Create hidden files in various system directories
-echo "$(build_flag 'H3')" > /opt/oc/.secret
-chmod 644 /opt/oc/.secret
+# H3 (FUNCTIONAL): hardcoded git credentials in a dev's home -- the "password"
+# is a JWT. Decode it to recover the flag. (Committed git creds = top finding.)
+cat > /home/user1/.git-credentials << GITEOF
+https://ci-bot:$(jwt_flag 'H3' 'ci-bot')@git.internal.oc
+GITEOF
+chown user1:user1 /home/user1/.git-credentials
+chmod 600 /home/user1/.git-credentials
 
 # Hidden file in home directory
-echo "$(build_flag 'M1')" > /home/user1/.hidden_flag
-chmod 644 /home/user1/.hidden_flag
-chown user1:user1 /home/user1/.hidden_flag
+# M1 (FUNCTIONAL): a .netrc whose API "password" is actually a JWT.
+cat > /home/user1/.netrc << NETEOF
+machine api.oc.internal
+login user1
+password $(jwt_flag 'M1' 'user1')
+NETEOF
+chown user1:user1 /home/user1/.netrc
+chmod 600 /home/user1/.netrc
 
-# Hidden directory with flag
+# Hidden directory with flag.
+# NOTE: /tmp is tmpfs on the production host, so anything written here is wiped
+# on reboot. Write it now (so the lab works immediately after setup) AND install
+# a systemd oneshot that recreates it on every boot, keeping the student-facing
+# path (/tmp/.hidden/secret.txt) identical while making the flag persistent.
+FLAG_N1_VALUE="$(jwt_flag 'N1' 'web-session')"
 mkdir -p /tmp/.hidden
-echo "$(build_flag 'N1')" > /tmp/.hidden/secret.txt
+echo "$FLAG_N1_VALUE" > /tmp/.hidden/secret.txt
 chmod 755 /tmp/.hidden
 chmod 644 /tmp/.hidden/secret.txt
+
+cat > /etc/systemd/system/oc-hidden-flag.service << EOF
+[Unit]
+Description=Recreate OC hidden flag in tmpfs /tmp after reboot
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p /tmp/.hidden && echo "$FLAG_N1_VALUE" > /tmp/.hidden/secret.txt && chmod 755 /tmp/.hidden && chmod 644 /tmp/.hidden/secret.txt'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable oc-hidden-flag.service 2>/dev/null || true
 
 # ===============================================
 # VULNERABILITY 8: Services and Processes
@@ -288,20 +451,51 @@ User=root
 WorkingDirectory=/opt/oc
 ExecStart=/opt/oc/monitor.sh
 Restart=always
-Environment="FLAG=$(build_flag 'V1')"
+Environment="OC_MONITOR_KEY=$(printf '%s' "$(build_flag 'V1')" | sha256sum | cut -c1-32)"
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# --- Internal API (FUNCTIONAL loot for V1 + D2): a root-only service on
+# 127.0.0.1:8899 returns a secret ONLY for a valid API key. Keys leak via the
+# service unit (V1, `systemctl cat oc-monitor`) and a shell profile (D2). The
+# flags live ONLY in the 700-root API script and are served over HTTP -> no
+# plaintext FLAG{ any student can read. Realistic (internal API + leaked key)
+# and functional (a real HTTP service).
+mkdir -p /opt/oc/.internal
+cat > /opt/oc/.internal/api.py << PYEOF
+#!/usr/bin/env python3
+import http.server, urllib.parse
+SECRETS = {
+    "$(printf '%s' "$(build_flag 'V1')" | sha256sum | cut -c1-32)": "$(build_flag 'V1')",
+    "$(printf '%s' "$(build_flag 'D2')" | sha256sum | cut -c1-32)": "$(build_flag 'D2')",
+}
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        key = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("key", [""])[0]
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+        if key in SECRETS:
+            self.wfile.write(('{"status":"ok","secret":"%s"}\n' % SECRETS[key]).encode())
+        else:
+            self.wfile.write(b'{"status":"unauthorized","hint":"valid X-API-Key / ?key= required"}\n')
+    def log_message(self, *a):
+        return
+http.server.HTTPServer(("127.0.0.1", 8899), H).serve_forever()
+PYEOF
+chmod 700 /opt/oc/.internal
+chmod 700 /opt/oc/.internal/api.py
+
 cat > /opt/oc/monitor.sh << 'EOF'
 #!/bin/bash
-while true; do
-    echo "Monitoring system..." > /tmp/monitor.log
-    sleep 60
-done
+# OC internal monitoring endpoint (loopback only).
+exec /usr/bin/python3 /opt/oc/.internal/api.py
 EOF
 chmod 755 /opt/oc/monitor.sh
+# Actually START the API (the unit used to just hold a flag in its env; now it
+# serves the internal API and MUST run for V1/D2 to be reachable).
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable --now oc-monitor.service 2>/dev/null || true
 
 # ===============================================
 # VULNERABILITY 9: Database Configurations
@@ -311,20 +505,56 @@ echo -e "${YELLOW}[*] Setting up database vulnerabilities...${NC}"
 # Create MySQL configuration with weak credentials
 mkdir -p /etc/mysql/conf.d
 cat > /etc/mysql/conf.d/oc.cnf << EOF
-# OC MySQL Configuration
-# $(build_flag 'M2')
+# OC MySQL Configuration -- read-only reporting account (client default).
+# NOTE: this file is world-readable and is auto-loaded by the mysql client, so
+# any local user inherits these creds -> SELECT from the internal DB. (M2 flag
+# lives in internal.secrets, seeded by Install-OCWA -- not in this file.)
 [client]
 user=oc_user
 password=weakpass123
 EOF
 chmod 644 /etc/mysql/conf.d/oc.cnf 2>/dev/null || true
 
-# Create PostgreSQL password file
-cat > /var/lib/postgresql/.pgpass << EOF
-localhost:5432:*:postgres:postgres123
-# $(build_flag 'L1')
+# --- L1 (REALISTIC + FUNCTIONAL): a leftover, world-readable DB-backup script
+# hardcodes a WORKING Postgres credential (a genuinely common finding). Using it,
+# the student connects and SELECTs a "customer" PII record whose notes field is
+# the flag. Weakness = secret in a readable script; consequence = DB access + PII.
+# Grep-proof: the flag lives in Postgres data (dir is 700 postgres), not any text
+# file a low-priv shell can read. No plaintext FLAG{ on disk for the student.
+if command -v psql >/dev/null 2>&1; then
+    systemctl enable --now postgresql 2>/dev/null || true
+    # wait briefly for the cluster socket
+    for _i in 1 2 3 4 5; do sudo -u postgres psql -tAc 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+    PG_APP_PW='Pg_App_S3cret!'
+    L1_VALUE="$(build_flag 'L1')"
+    sudo -u postgres psql -v ON_ERROR_STOP=0 >/dev/null 2>&1 <<SQL || true
+DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='oc_app') THEN CREATE ROLE oc_app LOGIN PASSWORD '${PG_APP_PW}'; END IF; END \$\$;
+SELECT 'CREATE DATABASE ocdb OWNER oc_app' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='ocdb')\gexec
+SQL
+    sudo -u postgres psql -d ocdb -v ON_ERROR_STOP=0 >/dev/null 2>&1 <<SQL || true
+CREATE TABLE IF NOT EXISTS customers (id serial PRIMARY KEY, name text, email text, notes text);
+INSERT INTO customers (name,email,notes)
+  SELECT 'Internal Audit','audit@chchcheckit.com','${L1_VALUE}'
+  WHERE NOT EXISTS (SELECT 1 FROM customers WHERE notes LIKE 'FLAG{%');
+INSERT INTO customers (name,email,notes)
+  SELECT 'Alice Reyes','areyes@chchcheckit.com','VIP account'
+  WHERE NOT EXISTS (SELECT 1 FROM customers WHERE name='Alice Reyes');
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO oc_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO oc_app;
+SQL
+    mkdir -p /opt/oc/scripts
+    cat > /opt/oc/scripts/pg_backup.sh << EOF
+#!/bin/bash
+# Nightly customer-DB backup (left in place by a former admin).
+# TODO: move this credential into the vault -- do NOT ship to prod.
+export PGPASSWORD='${PG_APP_PW}'
+pg_dump -h 127.0.0.1 -U oc_app ocdb > "/var/backups/ocdb_\$(date +%F).sql"
 EOF
-chmod 600 /var/lib/postgresql/.pgpass 2>/dev/null || true
+    chmod 644 /opt/oc/scripts/pg_backup.sh
+    echo -e "${GREEN}  [+] L1 functional Postgres loot planted (ocdb.customers + readable backup script)${NC}"
+else
+    echo -e "${RED}  [!] postgres unavailable - L1 functional flag skipped${NC}"
+fi
 
 # ===============================================
 # VULNERABILITY 10: Kernel and System Files
@@ -332,7 +562,15 @@ chmod 600 /var/lib/postgresql/.pgpass 2>/dev/null || true
 echo -e "${YELLOW}[*] Setting up kernel/system vulnerabilities...${NC}"
 
 # Create kernel module loading configuration
-echo "# $(build_flag 'B1')" > /etc/modprobe.d/oc.conf
+# B1 (FUNCTIONAL): a service token leaks in a world-readable worker config.
+mkdir -p /opt/oc/configs
+cat > /opt/oc/configs/service.env << SVCEOF
+# OC background worker config
+WORKER_CONCURRENCY=4
+SERVICE_TOKEN=$(jwt_flag 'B1' 'worker')
+SVCEOF
+chmod 644 /opt/oc/configs/service.env
+echo "# kernel module tuning" > /etc/modprobe.d/oc.conf
 echo "options dummy numdummies=2" >> /etc/modprobe.d/oc.conf
 chmod 644 /etc/modprobe.d/oc.conf
 
@@ -341,15 +579,34 @@ chmod 644 /etc/modprobe.d/oc.conf
 # ===============================================
 echo -e "${YELLOW}[*] Setting up Docker vulnerabilities...${NC}"
 
-# Add users to docker group (if Docker is installed)
+# Add users to docker group (docker.io is installed at the top of this script).
+# The docker group grants effective root, which is the intended privesc path, so
+# the daemon must be enabled and running for it to be exploitable.
 if command -v docker &> /dev/null; then
     usermod -aG docker user1 2>/dev/null || true
     usermod -aG docker developer 2>/dev/null || true
-    
-    # Create Docker configuration with flag
+
+    # daemon.json only HINTS — the flag is NOT here (grep-proof). The reward is a
+    # root-only file, reachable only via the docker-group -> root escape, e.g.
+    #   docker run -v /:/mnt --rm alpine cat /mnt/root/.docker_flag
+    # NOTE: dockerd REJECTS unknown keys (a "comment" key crash-loops the daemon and
+    # made this flag unreachable). Carry the hint in the valid "labels" option instead.
     mkdir -p /etc/docker
-    echo "{\"debug\": true, \"comment\": \"$(build_flag 'G3')\"}" > /etc/docker/daemon.json
+    echo '{"debug": true, "labels": ["oc.audit=on", "oc.hint=secrets-relocated-to-root-store"]}' > /etc/docker/daemon.json
     chmod 644 /etc/docker/daemon.json
+    echo "$(build_flag 'G3')" > /root/.docker_flag
+    chmod 600 /root/.docker_flag
+
+    # Make the docker-group privesc real: enable + start the daemon.
+    systemctl enable --now docker 2>/dev/null || true
+
+    # Pre-pull the alpine image so the documented docker-group escape
+    #   docker run -v /:/mnt --rm alpine cat /mnt/root/.docker_flag
+    # works reliably even if Docker Hub is slow/unreachable at exploit time.
+    sleep 3
+    docker pull alpine 2>/dev/null || echo -e "${YELLOW}  [!] could not pre-pull alpine now (Flag G3 docker path needs it cached or Hub access)${NC}"
+else
+    echo -e "${RED}  [!] docker not installed - Flag 'G3' (/etc/docker/daemon.json) skipped${NC}"
 fi
 
 # ===============================================
@@ -367,7 +624,7 @@ production:
   username: webapp_user
   password: SecretPass123
   host: localhost
-  # $(build_flag 'G1')
+  # secret_key_base + reporting creds stored in the internal DB (see ops runbook)
 EOF
 chmod 644 /opt/webapp/config/database.yml
 
@@ -379,14 +636,14 @@ echo -e "${YELLOW}[*] Setting up log file vulnerabilities...${NC}"
 # Create world-readable log with sensitive info
 echo "System initialized at $(date)" > /var/log/oc.log
 echo "Admin password changed to: P@ssw0rd123" >> /var/log/oc.log
-echo "$(build_flag 'F1')" >> /var/log/oc.log
+echo "$(date '+%Y-%m-%d %H:%M:%S') oc-auth[1123]: issued service token to svc-auth: $(jwt_flag 'F1' 'svc-auth')" >> /var/log/oc.log
 chmod 644 /var/log/oc.log
 
 # Create application log
 mkdir -p /var/log/webapp
 echo "[$(date)] Database connection established" > /var/log/webapp/app.log
 echo "[$(date)] User 'admin' logged in successfully" >> /var/log/webapp/app.log
-echo "[$(date)] DEBUG: $(build_flag 'G2')" >> /var/log/webapp/app.log
+echo "[$(date)] DEBUG session_jwt=$(jwt_flag 'G2' 'web-user') user=brandon path=/account" >> /var/log/webapp/app.log
 chmod 644 /var/log/webapp/app.log
 
 # ===============================================
@@ -395,7 +652,11 @@ chmod 644 /var/log/webapp/app.log
 echo -e "${YELLOW}[*] Setting up environment variable vulnerabilities...${NC}"
 
 # Add flag to environment
-echo "export SECRET_FLAG='$(build_flag 'D2')'" >> /etc/profile.d/oc.sh
+# D2 (FUNCTIONAL): a real internal-API key leaks in a shell profile. Using it
+# against the 127.0.0.1:8899 internal API returns the secret. The sk-... line is
+# a STALE decoy key the API rejects (teaches "verify your creds").
+echo "# OC internal API key (rotate quarterly)" >> /etc/profile.d/oc.sh
+echo "export OC_API_KEY='$(printf '%s' "$(build_flag 'D2')" | sha256sum | cut -c1-32)'" >> /etc/profile.d/oc.sh
 echo "export API_KEY='sk-1234567890abcdef'" >> /etc/profile.d/oc.sh
 chmod 644 /etc/profile.d/oc.sh
 
@@ -411,7 +672,7 @@ cat > /tmp/vuln.c << EOF
 #include <stdlib.h>
 
 void secret_function() {
-    system("echo '$(build_flag 'N2')'");
+    system("echo '$(enc_b64 'N2')' | base64 -d");
 }
 
 void vulnerable_function(char *input) {
@@ -430,34 +691,54 @@ int main(int argc, char *argv[]) {
 }
 EOF
 
-gcc -o /opt/oc/vulnerable_binary /tmp/vuln.c -fno-stack-protector -no-pie 2>/dev/null || true
-chmod +s /opt/oc/vulnerable_binary 2>/dev/null || true
-rm /tmp/vuln.c
+# Compile the SUID buffer-overflow challenge. The original swallowed all errors
+# with `2>/dev/null || true`, so on a host without gcc the binary silently never
+# appeared (Flag 'N2' missing). gcc/binutils are installed at the top of this
+# script; verify the result and warn loudly instead of failing silently.
+if command -v gcc >/dev/null 2>&1; then
+    if gcc -o /opt/oc/vulnerable_binary /tmp/vuln.c -fno-stack-protector -no-pie; then
+        chmod +s /opt/oc/vulnerable_binary
+        echo -e "${GREEN}  [+] vulnerable_binary compiled and SUID-set${NC}"
+    else
+        echo -e "${RED}  [!] gcc compile FAILED - Flag 'N2' vulnerable_binary NOT created${NC}"
+    fi
+else
+    echo -e "${RED}  [!] gcc not available - Flag 'N2' vulnerable_binary NOT created${NC}"
+fi
+rm -f /tmp/vuln.c
 
 # ===============================================
 # VULNERABILITY 16: Archive Files
 # ===============================================
 echo -e "${YELLOW}[*] Creating archive files with flags...${NC}"
 
-# Create archive with credentials and flag
+# T1 (FUNCTIONAL): the backup archive leaks a WORKING SSH private key. Extract
+# it -> ssh in as svc_backup (a key-only account, so the leaked key is the ONLY
+# way in) -> read the flag in its home. Realistic: keys left in old backups.
+useradd -m -s /bin/bash svc_backup 2>/dev/null || true
+passwd -l svc_backup 2>/dev/null || true
+mkdir -p /home/svc_backup/.ssh
+ssh-keygen -q -t ed25519 -N '' -C 'svc_backup@oc' -f /tmp/oc_t1_key
+cp /tmp/oc_t1_key.pub /home/svc_backup/.ssh/authorized_keys
+chown -R svc_backup:svc_backup /home/svc_backup/.ssh
+chmod 700 /home/svc_backup/.ssh
+chmod 600 /home/svc_backup/.ssh/authorized_keys
+echo "$(build_flag 'T1')" > /home/svc_backup/flag.txt
+chown svc_backup:svc_backup /home/svc_backup/flag.txt
+chmod 600 /home/svc_backup/flag.txt
+
 mkdir -p /tmp/archive_tmp
+cp /tmp/oc_t1_key /tmp/archive_tmp/id_ed25519
 cat > /tmp/archive_tmp/notes.txt << EOF
 Project Notes
 =============
-Remember to update the firewall rules
 Server migration scheduled for next month
-
-Old VPN credentials (deprecated):
-vpnuser:vpnpass123
-
-Development server: 10.0.0.50
-Test server: 10.0.0.51
-
-$(build_flag 'T1')
+Old VPN credentials (deprecated): vpnuser:vpnpass123
+Dev server: 10.0.0.50   Test server: 10.0.0.51
+Backup service key: ./id_ed25519   (login: svc_backup@<host>)
 EOF
-
-tar -czf /var/backups/old_project.tar.gz -C /tmp/archive_tmp notes.txt
-rm -rf /tmp/archive_tmp
+tar -czf /var/backups/old_project.tar.gz -C /tmp/archive_tmp notes.txt id_ed25519
+rm -rf /tmp/archive_tmp /tmp/oc_t1_key /tmp/oc_t1_key.pub
 chmod 644 /var/backups/old_project.tar.gz
 
 # ===============================================
@@ -469,7 +750,7 @@ echo -e "${YELLOW}[*] Setting up Git repository vulnerabilities...${NC}"
 mkdir -p /opt/development/project
 cd /opt/development/project
 git init 2>/dev/null || true
-echo "$(build_flag 'L2')" > .env
+echo "$(enc_b64 'L2')" > .env
 echo "DATABASE_URL=mysql://root:password@localhost/db" >> .env
 git add .env
 git config user.email "dev@local.com" 2>/dev/null || true
@@ -515,7 +796,7 @@ echo -e "${YELLOW}[*] Setting up scheduled task vulnerabilities...${NC}"
 cat > /var/spool/cron/atjobs/backup_job << EOF
 #!/bin/bash
 # Scheduled backup job
-# $(build_flag 'M2')
+# $(enc_b64 'M2')
 tar -czf /backup/system_$(date +%Y%m%d).tar.gz /etc/
 EOF
 chmod 644 /var/spool/cron/atjobs/backup_job 2>/dev/null || true
@@ -523,11 +804,34 @@ chmod 644 /var/spool/cron/atjobs/backup_job 2>/dev/null || true
 # ===============================================
 # Generate Flag Report
 # ===============================================
-echo -e "${GREEN}[+] Generating flag report...${NC}"
+# ===============================================
+# FINAL ROOT FLAG (Phase 8 privilege escalation)
+# The walkthrough's Flag 25 reads /root/root.txt after a student escalates to
+# root. The original script never created it. Place it root-only (0600) so it is
+# obtainable ONLY after a successful privesc.
+# ===============================================
+echo -e "${YELLOW}[*] Planting final root flag (/root/root.txt)...${NC}"
+echo "$(build_flag 'R2')" > /root/root.txt
+chown root:root /root/root.txt
+chmod 600 /root/root.txt
 
-# Generate report with actual flag values
+# Machine-readable flag values for cross-script use: Install-OCWA (which runs
+# later, once MariaDB is up) seeds M2/G1 into the internal.secrets DB table.
+# Root-only; students can't read /root.
+cat > /root/.oc_flags.env << ENVEOF
+M2='$(build_flag 'M2')'
+G1='$(build_flag 'G1')'
+ENVEOF
+chmod 600 /root/.oc_flags.env
+
+# On-box answer-key report DISABLED by design (v5 realism pass): a student who
+# roots the box must NOT be able to read the full key. The report heredoc below is
+# redirected to /dev/null so nothing persists. Generate the instructor key off-box,
+# admin-only, with Generate-AnswerKey.py (reads the same OC_FLAG_SEED + flag keys).
+echo -e "${DARKYELLOW:-${YELLOW}}[answer key] On-box report disabled; use Generate-AnswerKey.py (admin, off-box).${NC}"
+
 REPORT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
-REPORT_FILE="/root/OC_FLAGS_REPORT_$(date +%Y%m%d_%H%M%S).html"
+REPORT_FILE="/dev/null"
 
 cat > "$REPORT_FILE" << EOF
 <!DOCTYPE html>
@@ -560,10 +864,10 @@ cat > "$REPORT_FILE" << EOF
         
         <div class="stats">
             <h2>Statistics</h2>
-            <p><strong>Total Flags:</strong> 22</p>
+            <p><strong>Total Flags:</strong> 23</p>
             <p><strong>Easy Flags:</strong> 10</p>
             <p><strong>Medium Flags:</strong> 7</p>
-            <p><strong>Hard Flags:</strong> 5</p>
+            <p><strong>Hard Flags:</strong> 6</p>
             <p><strong>Report Generated:</strong> $REPORT_DATE</p>
         </div>
         
@@ -756,12 +1060,25 @@ cat > "$REPORT_FILE" << EOF
                     <td class="hard">Hard</td>
                     <td>Cryptanalysis</td>
                 </tr>
+                <tr>
+                    <td>023</td>
+                    <td class="flag-code">$(build_flag 'R2')</td>
+                    <td>/root/root.txt</td>
+                    <td>Final root flag (readable only after privilege escalation)</td>
+                    <td class="hard">Hard</td>
+                    <td>Privilege escalation</td>
+                </tr>
             </tbody>
         </table>
     </div>
 </body>
 </html>
 EOF
+# Answer key stays root-only (0600) under /root (mode 700). Ideally the instructor
+# keeps it OFF the box; hardened so a rooted student gains nothing unearned.
+# NOTE: the on-box report is disabled (REPORT_FILE=/dev/null); guard the chmod so we
+# never alter /dev/null's permissions (a 600 /dev/null breaks non-root redirects box-wide).
+[ "$REPORT_FILE" != "/dev/null" ] && chmod 600 "$REPORT_FILE" || true
 
 # ===============================================
 # Final Setup Steps
@@ -777,6 +1094,14 @@ chmod 755 /opt/secrets
 systemctl restart ssh 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 
+# --- DECOY canaries: punish a blind `grep -rIa 'FLAG{' /`. The answer key /
+# submission system MUST reject every FLAG{DECOY_*}. These sit in the most obvious
+# grep magnets so lazy students burn time; the real flags are encoded/gated.
+printf 'OC_AUDIT_TOKEN=FLAG{DECOY_TRY_HARDER_9F2A}\n' >> /etc/environment
+echo "# TODO(dev): rotate before prod -- FLAG{DECOY_NOT_THIS_ONE_4C1B}" >> /opt/webapp/config/database.yml
+sed -i '1i # legacy marker FLAG{DECOY_KEEP_LOOKING_7A33}' /var/log/oc.log 2>/dev/null || true
+echo "backup verified FLAG{DECOY_ALMOST_5E90}" >> /var/backups/system/old_passwords.txt
+
 # Create setup completion marker
 touch /opt/oc/.setup_complete
 date > /opt/oc/.setup_complete
@@ -790,7 +1115,7 @@ echo -e "${GREEN}===============================================${NC}"
 echo -e "${BLUE}Total Flags Planted:${NC}"
 echo -e "  Easy:   10 flags"
 echo -e "  Medium: 7 flags"
-echo -e "  Hard:   5 flags"
+echo -e "  Hard:   6 flags"
 echo -e ""
 echo -e "${YELLOW}Network Credentials Location:${NC}"
 echo -e "  /opt/secrets/network_credentials.txt"
