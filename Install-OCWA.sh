@@ -51,8 +51,8 @@ echo -e "\033[96m\033[1m
 \033[0m"
 echo
 echo -e "\033[92m╓────────────────────────────────────────────────────────────╖"
-center_text "$(get_language_message "Welcome to the OC setup!" "¡Bienvenido al instalador de DVWA!")" "$line_length"
-center_text "$(get_language_message "Script Name: Install-OCWA.sh " "Nombre del Script: Install-DVWA.sh ")" "$line_length"
+center_text "$(get_language_message "Welcome to the OC setup!" "¡Bienvenido al instalador de OCWA!")" "$line_length"
+center_text "$(get_language_message "Script Name: Install-OCWA.sh " "Nombre del Script: Install-OCWA.sh ")" "$line_length"
 center_text "$(get_language_message "Reimagined by: 0x31i " "OG Autor: IamCarron ")" "$line_length"
 center_text "$(get_language_message "Github Repo: https://github.com/0x31i/OCWA-Script" "GitHub Repo: https://github.com/0x31i/OCWA-Script")" "$line_length"
 center_text "$(get_language_message "Installer Version: 1.0.5 " "Versión del Instalador: 1.0.5 ")" "$line_length"
@@ -118,13 +118,13 @@ sql_commands() {
 
     # Verificar si la base de datos ya existe
     if ! $sql_command -e "CREATE DATABASE IF NOT EXISTS dvwa;"; then
-        echo -e "$(get_language_message "\033[91mAn error occurred while creating the DVWA database." "\033[91mSe ha producido un error al crear la base de datos DVWA.")"
+        echo -e "$(get_language_message "\033[91mAn error occurred while creating the OCWA database." "\033[91mSe ha producido un error al crear la base de datos OCWA.")"
         return 1
     fi
 
     # Verificar si el usuario ya existe
     if ! $sql_command -e "CREATE USER IF NOT EXISTS 'dvwa'@'localhost' IDENTIFIED BY 'p@ssw0rd';"; then
-        echo -e "$(get_language_message "\033[91mAn error occurred while creating the DVWA user." "\033[91mSe ha producido un error al crear el usuario DVWA.")"
+        echo -e "$(get_language_message "\033[91mAn error occurred while creating the OCWA user." "\033[91mSe ha producido un error al crear el usuario OCWA.")"
         return 1
     fi
 
@@ -157,7 +157,7 @@ check_program php-gd
 check_program libapache2-mod-php
 check_program git
 
-# Descargar el repositorio DVWA desde GitHub / Download DVWA repository from GitHub
+# Descargar el repositorio OCWA desde GitHub / Download OCWA repository from GitHub
 
 # Comprobando si la carpeta ya existe / Checking if the folder already exists
 if [ -d "/var/www/html/OC" ]; then
@@ -176,14 +176,14 @@ if [ -d "/var/www/html/OC" ]; then
         # Borrar la carpeta existente / Delete existing folder
         rm -rf /var/www/html/OC
 
-        # Descargar DVWA desde GitHub / Download DVWA from GitHub
+        # Descargar OCWA desde GitHub / Download OCWA from GitHub
         download_message=$(get_language_message "\e[96mDownloading OC from GitHub...\e[0m" "\e[96mDescargando OC desde GitHub...\e[0m")
         echo -e "$download_message"
         git clone https://github.com/0x31i/OCWA.git /var/www/html/OC
         sleep 2
     elif [ "$user_response" == "n" ]; then
         # El usuario elige no descargar / User chooses not to download
-        no_download_message=$(get_language_message "\e[96mContinuing without downloading OC.\e[0m" "\e[96mContinuando sin descargar DVWA.\e[0m")
+        no_download_message=$(get_language_message "\e[96mContinuing without downloading OC.\e[0m" "\e[96mContinuando sin descargar OCWA.\e[0m")
         echo -e "$no_download_message"
     else
         # Respuesta inválida / Invalid answer
@@ -192,8 +192,8 @@ if [ -d "/var/www/html/OC" ]; then
         exit 1
     fi
 else
-    # La carpeta no existe, descargar DVWA desde GitHub / Folder does not exist, download DVWA from GitHub
-    download_message=$(get_language_message "\e[96mDownloading DVWA from GitHub...\e[0m" "\e[96mDescargando DVWA desde GitHub...\e[0m")
+    # La carpeta no existe, descargar OCWA desde GitHub / Folder does not exist, download OCWA from GitHub
+    download_message=$(get_language_message "\e[96mDownloading OCWA from GitHub...\e[0m" "\e[96mDescargando OCWA desde GitHub...\e[0m")
     echo -e "$download_message"
     git clone https://github.com/0x31i/OCWA.git /var/www/html/OC
     sleep 2
@@ -226,9 +226,9 @@ fi
 run_sql_commands
 sleep 2
 
-# Copia de la carpeta DVWA a /var/www/html / Coping DVWA folder to /var/www/html
-dvwa_config_message=$(get_language_message "\e[96mConfiguring OCWA...\e[0m" "\e[96mConfigurando OCWA...\e[0m")
-echo -e "$dvwa_config_message"
+# Copia de la carpeta OCWA a /var/www/html / Copying OCWA folder to /var/www/html
+oc_config_message=$(get_language_message "\e[96mConfiguring OCWA...\e[0m" "\e[96mConfigurando OCWA...\e[0m")
+echo -e "$oc_config_message"
 cp /var/www/html/OC/config/config.inc.php.dist /var/www/html/OC/config/config.inc.php
 
 # Set the default security level to 'medium' so the web-exploitation phase works
@@ -246,7 +246,7 @@ sed -i "/default_security_level/s/'impossible'/'medium'/" /var/www/html/OC/confi
 sed -i 's/FLAG{DOBBY[0-9]*}//' /var/www/html/OC/dvwa/includes/ocPage.inc.php 2>/dev/null || true
 sleep 2
 
-# Asignar los permisos adecuados a DVWA / Assign the appropriate permissions to DVWA
+# Asignar los permisos adecuados a OCWA / Assign the appropriate permissions to OCWA
 permissions_config_message=$(get_language_message "\e[96mConfiguring permissions...\e[0m" "\e[96mConfigurando permisos...\e[0m")
 echo -e "$permissions_config_message"
 chown -R www-data:www-data /var/www/html/OC
@@ -306,8 +306,8 @@ systemctl enable apache2 &>/dev/null
 systemctl restart apache2 &>/dev/null
 sleep 2
 
-# Seed the DVWA database (schema + custom users incl. brandon) so the app is
-# usable immediately. A fresh DVWA otherwise needs a manual setup.php
+# Seed the OCWA database (schema + custom users incl. brandon) so the app is
+# usable immediately. A fresh OCWA otherwise needs a manual setup.php
 # "Create / Reset Database" click before ANY login works, which blocks every
 # web/upload flag on a turnkey student build.
 seed_jar=$(mktemp)

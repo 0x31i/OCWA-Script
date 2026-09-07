@@ -78,7 +78,7 @@ When it finishes, browse to the box's IP to reach the OCWA login page.
 
 The full box is a web-to-root chain, from the application down to the host:
 
-- **Web application:** OCWA (a DVWA-style app) vulnerabilities, including source-comment
+- **Web application:** OCWA (a deliberately vulnerable web app) vulnerabilities, including source-comment
   leaks, weak login, and embedded or encoded secrets.
 - **On-host credential recovery:** `~/.netrc`, `~/.git-credentials`, `~/.ssh` key looting,
   world-readable cron scripts, log-file tokens, service `.env` files, legacy password
